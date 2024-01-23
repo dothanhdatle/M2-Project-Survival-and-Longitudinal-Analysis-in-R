@@ -1,0 +1,996 @@
+---
+title: "Survival analysis project"
+output: html_document
+date: "2023-10-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Survival and Longitudinal Data Analysis project
+# Survival analysis on the mortality of covid
+
+## Do Thanh Dat LE, Piseth KHENG - M2DS
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(corrplot)
+library(survival)
+library(survminer)
+library(KMsurv)
+library(ggfortify)
+```
+
+```{r}
+# Load data
+df = read.table('proj_covid.csv', sep = ',', header = T)
+head(df)
+```
+
+First we check that if there is any row with full NA values
+
+```{r}
+# Check if there is a row with full NA values
+sum(rowSums(is.na(df)) == ncol(df))
+```
+There is also no row with full of NA values in the data. Then we check and remove the patients with NA values in outcome (unknown outcome)
+
+```{r}
+na_row = which(is.na(df$outcome))
+print(df[na_row,])
+df = df[!is.na(df$outcome), ]
+```
+
+There is no patient with unknown outcome in the data
+
+```{r}
+# Check the outcome
+unique(df$outcome)
+```
+We could see there are many outcomes. However, we could divide the patients into 2 events: "death", "discharge". 
+
+- The outcomes: "dead", "death", "died", "Deceased" will be considered as "death"
+- The outcomes: "discharge"  "discharged" "Discharged" "recovered" will be considered as "discharge"
+
+We create the censoring indicator variable = 1 when the patient has event "death", it will be 0 when the patient has "discharge" event. 
+
+```{r}
+# Transform the column outcome
+df = df %>%
+  mutate(outcome = case_when(
+    outcome %in% c('discharge', 'discharged', 'Discharged', 'recovered') ~ 'discharge',
+    outcome %in% c('dead', 'death', 'died', 'Deceased') ~ 'death'
+  ))
+head(df)
+```
+
+```{r}
+table(df$outcome)
+```
+
+# 1. Create the main variable of interest - duration or time to death, and censoring indicator.
+
+```{r}
+# Convert date columns to Date objects
+df$date_confirmation = as.Date(df$date_confirmation, format="%d.%m.%Y")
+df$date_onset_symptoms = as.Date(df$date_onset_symptoms, format="%d.%m.%Y")
+df$date_admission_hospital = as.Date(df$date_admission_hospital, format="%d.%m.%Y")
+df$date_death_or_discharge = as.Date(df$date_death_or_discharge, format="%d.%m.%Y")
+
+# Create duration variable
+df$duration = as.numeric(difftime(df$date_death_or_discharge, df$date_onset_symptoms, units = "days"))
+
+# Remove rows with duration equal to 0
+df = subset(df, duration != 0)
+
+# Create censoring indicator variable
+df$censoring_indicator = as.integer(ifelse(df$outcome == 'death', 1, 0))
+
+
+head(df)
+```
+
+```{r}
+# Sanity check
+df$date_onset_symptoms[df$duration<0]
+df$date_death_or_discharge[df$duration<0]
+df$duration[df$duration<0]
+sum(df$duration == 0)
+```
+We see that there are some mistakes in the recorded data between the "date_onset_symptoms" and "date_death_or_discharge". To deal with this, we will assume that the record date in "date_onset_symptoms" was actually in the "date_death_or_discharge", and vice versa. Therefore, we will convert the negative value in the "Duration" to a positive value.
+
+```{r}
+df$duration = abs(df$duration)
+df$duration[df$duration<0]
+```
+
+```{r}
+# Check death event
+sum(df$censoring_indicator)
+```
+
+There are 620 death cases and 180 discharge cases.
+
+# 2.Check the variable symptoms and encode the symptoms information
+
+```{r}
+# Check the symptoms
+unique(df$symptoms)
+```
+There are some patients has symptom = "None" so we need to change it to " ".
+
+```{r}
+df$symptoms[df$symptoms == "none"] = ""
+symp_list = c(unique(df$symptoms))
+
+# Function to split symptoms based on both ":" and ", "
+split_symptoms = function(symptoms_string) {
+  symptoms = unlist(strsplit(symptoms_string, ", |:"))
+  symptoms[symptoms != ""]  # Remove empty strings
+}
+
+all_symptoms = split_symptoms(symp_list)
+
+# Remove duplicates
+unique_symptoms = unique(all_symptoms)
+unique_symptoms
+```
+We can see there are some symptoms have typo mistakes: 
+- "myalgia", "myalgias", "mialgia" (typo mistake) --> "myalgia"
+- "fatigue" and "fatigure" (typo mistake) --> "fatigue"
+- "gasp" and "grasp" (typo mistake) --> "gasp"
+
+Moreover, we will combine some symptoms that are similar in one feature based on CDC (https://www.cdc.gov/coronavirus/2019-ncov/symptoms-testing/symptoms.html):
+
+- Fatigue and weak: fatigue, transient fatigue, systemic weakness, weak, and body malaise.
+- Difficulty breathing: shortness of breath, difficulty breathing, dyspnea, and gasp.
+- Chest discomfort: chest distress, chest pain, chest discomfort, and discomfort.
+- Muscle aches: myalgia, muscular soreness.
+- Cough symptoms: cough, dry cough.
+- Throat symptoms: sore throat, dysphagia
+- Fever and chills: fever, chills, cold chills, cold, and sensation of chill.
+- Neurological symptoms: headache, dizziness, somnolence, obnubilation
+- Gastrointestinal symptoms: anorexia, emesis, diarrhea.
+- Respiratory symptom: respiratory, runny nose, running nose, expectoration, little sputum.
+- Pneumonia: pneumonia, severe pneumonia, and severe (assuming that it is severe pneumonia).
+- Severe symptoms: acute respiratory distress syndrome (ARDS), acute respiratory failure, septic shock, multiple organ failure, cardiogenic shock, acute renal failure.
+
+We will correct this and create binary variables for these symptoms. These variables will have value = 1 if the patient has that symptom and 0 if the patient do not has. Finally, there are total 12 symptoms binary variables.
+
+```{r}
+# create binary variables
+for (symptom in unique_symptoms) {
+  df[[symptom]] = as.integer(sapply(df$symptoms, function(symptom_string) symptom %in% strsplit(symptom_string, ", |:")[[1]]))
+}
+
+# combine the similar symptoms in 1 column
+Symptoms = list(
+  fatigue_and_weak = c("fatigue", "fatigure", "transient fatigue", "systemic weakness", "weak", "body malaise"),
+  difficulty_breathing = c("dyspnea", "shortness of breath", "gasp", "grasp", "difficulty breathing"),
+  chest_discomfort = c("discomfort", "chest discomfort", "chest distress", "chest pain"),
+  muscle_aches = c("myalgia", "mialgia", "myalgias", "muscular soreness"),
+  cough_symptoms = c("dry cough", "cough"),
+  throat_symptoms = c("sore throat", "dysphagia"),
+  fever_and_chills = c("fever", "chills", "sensation of chill", "cold chills", "colds"),
+  neurological_symptoms = c("headache", "dizziness", "somnolence", "obnubilation"),
+  gastrointestinal_symptoms = c("anorexia", "emesis", "diarrhea"),
+  respiratory_symptoms = c("respiratory symptoms", "running nose", "runny nose", "expectoration", "little sputum"),
+  pneumonia_symptoms = c("pneumonia", "severe pneumonia", "Severe"),
+  severe_symptoms = c("acute respiratory distress syndrome", "acute respiratory failure", "septic shock", "multiple organ failure", "cardiogenic shock", "acute renal failure")
+)
+ 
+for (new_col in names(Symptoms)) {
+  df[[new_col]] <- as.integer(apply(df[, Symptoms[[new_col]], drop=FALSE], 1, function(x) any(x == 1)))
+}
+
+# drop all the columns that we have already combined including "symptoms"
+df <- df[ , !(names(df) %in% c(unlist(Symptoms), "symptoms"))]
+```
+
+
+# 3. Date_admission_hospital
+We encode hospitalization information as binary variable and create a new variable for time until hospitalization
+
+```{r}
+# Encode hospitalization information as binary variable
+df$hospitalized = ifelse(!is.na(df$date_admission_hospital), 1, 0)
+
+# Create a new variable for time until hospitalization
+df$time_until_hospitalization = as.numeric(difftime(df$date_admission_hospital, df$date_onset_symptoms, units = "days"))
+# Replace NA value with 0
+df$time_until_hospitalization <- sapply(df$time_until_hospitalization, function(x) ifelse(is.na(x), 0, x))
+
+# Remove variable date_admission_hospital
+df = subset(df, select = -date_admission_hospital)
+```
+
+
+# 4. Other Variables 
+
+## Chronic diseases
+
+Chronic diseases can worsen the condition of COVID-19 patients. The variable chronic_disease is presented by string with the disease's name. We will create an variable called number_chronic_disease which is the number of chronic disease for each patient.
+
+```{r}
+disease_list = c(unique(df$chronic_disease))
+df$num_chronic_diseases <- sapply(strsplit(as.character(df$chronic_disease), ", |:"), function(x) length(x))
+# Remove variable chronic_disease
+df = subset(df, select = -chronic_disease)
+```
+
+## Age
+
+```{r}
+unique(df$age)
+```
+There are some patients without age information, we will remove these patients. We also transform some age interval value:
+- "50-59" --> "55"
+- "20-29" --> "25"
+- "80-89" --> "85"
+- "60-69" --> "65"
+
+```{r}
+# Remove patients without age
+no_age_ind = which(df$age=="")
+df = df[-no_age_ind,]
+
+# transform some age interval value
+
+age_map <- c("50-59" = 55, "20-29" = 25, "80-89" = 85, "60-69" = 65)
+
+df <- df %>%
+  mutate(age = ifelse(age %in% names(age_map), age_map[age], age))
+
+# change age to type numeric
+df$age = as.numeric(df$age)
+```
+
+## lives_in_Wuhan
+If a patient has city or province in Wuhan, the variable lives_in_Wuhan will be "yes", else "no"
+
+```{r}
+df$lives_in_Wuhan <- ifelse(grepl("Wuhan", df$city) | grepl("Wuhan", df$province), "yes", "no")
+unique(df$lives_in_Wuhan)
+```
+
+## country
+```{r}
+unique(df$country)
+```
+Check the patients with no country information
+
+```{r}
+ind = which(df$country == "")
+df[ind, c("province")]
+```
+
+We see that the country of these patients is "Taiwan"
+
+```{r}
+df$country[ind] = "Taiwan"
+unique(df$country)
+```
+
+```{r}
+country_patients <- table(df$country)
+country_patients
+barplot(country_patients, main = "Patientes of Countries", xlab = "Country", ylab = "Patients", col = "skyblue")
+```
+
+We could see that most patients come from Philippines, next is Singapore, China. Therefore, we will divide patients into 4 country groups: Philippines, Singapore, China, Others. 
+
+```{r}
+df$country_groups = ifelse(df$country == "Philippines" | df$country == "Singapore" | df$country == "China", df$country, "Others")
+unique(df$country_groups)
+```
+
+## travel_history_binary
+There are some missing values, we assume that those patients did not have travel history.
+
+```{r}
+df$travel_history_binary = ifelse(df$travel_history_binary == "", "False", df$travel_history_binary)
+```
+
+Finally, we remove some features that we will not use in survival analysis
+
+```{r}
+columns_to_remove = c("date_confirmation", "date_onset_symptoms", "date_death_or_discharge", "travel_history_dates", "travel_history_location", "reported_market_exposure", "location", "city", "province", "country", "additional_information")
+df <- df[, !names(df) %in% columns_to_remove]
+```
+
+
+# 5. Graphical illustration
+```{r}
+barplot(table(df$country), main = "Patientes of Countries", xlab = "Country", ylab = "Patients", col = "skyblue")
+```
+
+```{r}
+# bar chart of symptom
+symptom_count = colSums(df[,12:23])
+new_df <- data.frame(type = names(symptom_count), values = symptom_count)
+ggplot(new_df, aes(x = reorder(type, values), y = values)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "Type", y = "Count", title = "Frequency of Symptoms") +
+  theme_minimal()
+```
+According to the bar chart, it appears that the most frequency symptoms is 'fever and chills', the second is "cough symptoms", so these symptoms are the most common symptoms of COVID-19 patients. The fatigue and weak, respiratory and difficulty breathing symptoms appeared with moderate frequency. The symptom "conjunctivitis" has very low frequency, so we will remove this symptom
+
+```{r}
+df = subset(df, select = -c(conjunctivitis))
+```
+
+```{r}
+# plot the distribution of age
+library(gridExtra)
+
+p1=ggplot(df, aes(x = age, fill = outcome)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density of Age by Outcome")
+
+p2=ggplot(df, aes(x = age, fill = sex)) +
+  geom_density(binwidth = 30, alpha = 0.5) +
+  labs(title = "Density of Age by Sex")
+
+p3=ggplot(df, aes(x = age, fill = country_groups)) +
+  geom_boxplot(alpha = 0.5) +
+  coord_flip() +
+  labs(title = "Density of Age by Country Groups")
+
+grid.arrange(p1, p2, p3, nrow = 3)
+```
+It is reasonable that the old people have a high risk of dead. The distribution of age is balance for male and female. The median age for 4 country group is nearly equal about 50, the age of Chinese and Philippines is higher than Singapore and other countries. 
+
+```{r}
+ggplot(df, aes(x = duration, y = outcome ,fill = outcome)) +
+  geom_boxplot(alpha = 0.7) +
+  xlim(0,60) +
+  coord_flip() +
+  labs(title = "Density of Duration by Outcome")
+```
+The median duration for the COVID-19 patients to discharge is twice as long as the duration for the patient to die, so the median time for patients to discharge is quite long (about 20 days) but the COVID-19 patients could died quite soon with median time about 10 days.  
+
+```{r}
+# plot number of death and discharge people of each country
+ggplot(df, aes(x = country_groups, fill = outcome)) + 
+  geom_bar(position = position_dodge(preserve = "single"))
+```
+We can see from the graph that Philippines had the highest number of deaths and, the second is China and the number of deaths was higher than the number of discharges in these 2 countries. The death rate in the Philippines is very high compared to the discharge rate. In Singapore, there is no death, all patients discharged. 
+```{r}
+# plot number of patients with chronic diseases by the outcome
+ggplot(df, aes(x = chronic_disease_binary, fill = outcome)) + 
+  geom_bar(position = "fill")
+```
+
+```{r}
+# plot number of patients with number of chronic diseases by the outcome
+ggplot(df, aes(x = num_chronic_diseases, fill = outcome)) + 
+  geom_bar(position = "fill")
+```
+
+It seem strange on this graph that the patients with chronic disease has high rate of discharge than the ones without chronic diseases.
+
+```{r}
+# plot number of patients with travel history by the outcome
+ggplot(df, aes(x = travel_history_binary, fill = outcome)) + 
+  geom_bar(position = "fill")
+```
+We can see in the graph that the patients with travel history information has a very low death rate compared to who without travel history information.
+
+```{r}
+# Change variables type into factor
+df_binary = df %>% 
+  select_if(is.numeric) %>%
+  select(-c(age, latitude, longitude, duration, time_until_hospitalization, num_chronic_diseases, censoring_indicator))
+
+df_categorical = df %>% select(c(sex, outcome, chronic_disease_binary, lives_in_Wuhan, travel_history_binary, country_groups))
+
+factor_col = c(names(df_categorical),names(df_binary))
+
+for (i in 1:length(factor_col)) {
+  df[,factor_col[i]] = factor(df[,factor_col[i]])
+}
+```
+
+```{r}
+# Check the data again
+head(df)
+```
+
+```{r}
+# 6. Correlation plot
+df_dummy = df %>%
+  mutate_if(is.factor, as.numeric) %>%
+  select(-c(ID, outcome))
+
+corr <- cor(df_dummy)
+corrplot(corr, is.corr=TRUE, tl.col="black", na.label=" ", method = "circle")
+```
+Regarding the correlation matrix, we could see that there are some variables with high correlation to the censoring_indicator variable such as age, travel_history_binary, hospitalized, and time_until_hospitalization. In which, the age has positive correlation to the censoring_indicator, this could be explained that the old COVID-19 patients have a high risk to died than young patients. The travel_history_binary, hospitalized, and time_until_hospitalization have negative correlations to the censoring_indicator, so the patients with travel history information or being hospitalized long time have low death rate.
+There is no variable with high correlation to the duration (time to death).
+
+# 7. Survival curves by categorical variables
+
+## a. Sex
+```{r}
+# Sex
+fit_sex = survfit(Surv(duration, censoring_indicator) ~ sex, data = df)
+ggsurvplot(fit_sex, data = df, risk.table = TRUE, title = "Survival Functions by Sex")
+autoplot(fit_sex)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ sex, data = df)
+```
+
+Regarding the graph, it seems that there is difference in survival functions between male and female. We use log-rank test to check this. With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.06 > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (females and males).
+
+## b. Chronic disease
+```{r}
+# chronic_disease_binary
+fit_chronic_disease = survfit(Surv(duration, censoring_indicator) ~ chronic_disease_binary, data = df)
+ggsurvplot(fit_chronic_disease, data = df, risk.table = TRUE, title = "Survival Functions by chronic disease binary")
+autoplot(fit_chronic_disease)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ chronic_disease_binary, data = df)
+```
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.02 < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there is a significant difference in the survival functions between the two groups (patients with chronic diseases and patients without chronic diseases).
+
+## c. Live in Wuhan
+```{r}
+# lives_in_wuhan
+fit_wuhan = survfit(Surv(duration, censoring_indicator) ~ lives_in_Wuhan, data = df)
+ggsurvplot(fit_wuhan, data = df, risk.table = TRUE, title = "Survival Functions by lives_in_wuhan")
+autoplot(fit_wuhan)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ lives_in_Wuhan, data = df)
+```
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.8 > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (patients who lives in Wuhan and who does not).
+
+## d. Travel history
+```{r}
+# travel_history_binary
+fit_travel = survfit(Surv(duration, censoring_indicator) ~ travel_history_binary, data = df)
+ggsurvplot(fit_travel, data = df, risk.table = TRUE, title = "Survival Functions by travel_history_binary")
+autoplot(fit_travel)
+```
+
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ travel_history_binary, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there is a significant difference in the survival functions between the two groups (patients who has travel history and who does not).
+
+## d. Hospitalized
+```{r}
+# hospitalized
+fit_hospitalized = survfit(Surv(duration, censoring_indicator) ~ hospitalized, data = df)
+ggsurvplot(fit_hospitalized, data = df, risk.table = TRUE, title = "Survival functions by hospitalized")
+autoplot(fit_hospitalized)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ hospitalized, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there is a significant difference in the survival functions between the two groups (patients who were hospitalized and who were not hospitalized).
+
+## e. Country
+```{r}
+fit_country = survfit(Surv(duration, censoring_indicator) ~ country_groups, data = df)
+ggsurvplot(fit_country, data = df, risk.table = TRUE, pval = TRUE, title = "Survival functions by country")
+autoplot(fit_country)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ country_groups, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there are significant difference in the survival functions among the 4 country groups.
+
+## f. fever and chills
+```{r}
+# fever_and_chills
+fit_fever = survfit(Surv(duration, censoring_indicator) ~ fever_and_chills, data = df)
+ggsurvplot(fit_fever, data = df, risk.table = TRUE, pval = TRUE, title = "Survival Functions by fever and chills")
+autoplot(fit_fever)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ fever_and_chills, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there is a significant difference in the survival functions between the two groups (the patients with fever or chills and patients without fever or chills)
+
+## g. cough symptoms
+```{r}
+# cough_symptoms
+fit_cough = survfit(Surv(duration, censoring_indicator) ~ cough_symptoms, data = df)
+ggsurvplot(fit_cough, data = df, risk.table = TRUE, pval = TRUE, title = "Survival Functions by cough symptoms")
+autoplot(fit_cough)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ cough_symptoms, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there is a significant difference in the survival functions between the two groups (patients with cough symptoms and patients without cough symptoms).
+
+## h. fatigue and weak
+```{r}
+# fatigue and weak
+fit_fatigue = survfit(Surv(duration, censoring_indicator) ~ fatigue_and_weak, data = df)
+ggsurvplot(fit_fatigue, data = df, risk.table = TRUE, pval = TRUE, title = "Survival Functions by symptom fatigue and weak")
+autoplot(fit_fatigue)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ fatigue_and_weak, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.02 < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there is a significant difference in the survival functions between the two groups (patients with fatigue and weak symptoms and patients without fatigue and weak symptoms).
+
+## h. respiratory symptoms
+```{r}
+# respiratory_symptoms
+fit_respiratory = survfit(Surv(duration, censoring_indicator) ~ respiratory_symptoms, data = df)
+ggsurvplot(fit_respiratory, data = df, risk.table = TRUE, pval = TRUE, title = "Survival Functions by respiratory symptoms")
+autoplot(fit_respiratory)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ respiratory_symptoms, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there is a significant difference in the survival functions between the two groups (patients with respiratory symptoms and patients without respiratory symptoms).
+
+```{r}
+# difficult breathing
+fit_breath = survfit(Surv(duration, censoring_indicator) ~ difficulty_breathing, data = df)
+ggsurvplot(fit_breath, data = df, risk.table = TRUE, pval = TRUE, title = "Survival Functions by difficultty in breathing symptoms")
+autoplot(fit_breath)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ difficulty_breathing, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (patients with difficulty breathing symptoms and patients without difficulty breathing symptoms).
+
+## i. Throat symptoms
+```{r}
+# throat symptoms
+fit_throat = survfit(Surv(duration, censoring_indicator) ~ throat_symptoms, data = df)
+ggsurvplot(fit_throat, data = df, risk.table = TRUE, pval = TRUE, title = "Survival Functions by throat symptoms")
+autoplot(fit_throat)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ throat_symptoms, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.004 < 0.05, suggesting that there is enough evidence to reject the null hypothesis. In other words, there is a significant difference in the survival functions between the two groups (patients with throat symptoms and patients without throat symptoms).
+
+## j.severe symptoms
+```{r}
+# severe symptoms
+fit_severe = survfit(Surv(duration, censoring_indicator) ~ severe_symptoms, data = df)
+ggsurvplot(fit_severe, data = df, risk.table = TRUE, title = "Survival Functions by severe symptoms")
+autoplot(fit_severe)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ severe_symptoms, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.7 > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (patients with severe_symptoms and patients without severe_symptoms).
+
+## k. neurological symptoms
+```{r}
+# severe symptoms
+fit_neuro = survfit(Surv(duration, censoring_indicator) ~ neurological_symptoms, data = df)
+ggsurvplot(fit_neuro, data = df, risk.table = TRUE, title = "Survival Functions by neurological symptoms")
+autoplot(fit_neuro)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ neurological_symptoms, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.1 > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (patients with neurological symptoms and patients without neurological symptoms).
+
+## k.chest discomfort
+```{r}
+# chest discomfort
+fit_chest = survfit(Surv(duration, censoring_indicator) ~ chest_discomfort, data = df)
+ggsurvplot(fit_chest, data = df, risk.table = TRUE, title = "Survival Functions by chest discomfort")
+autoplot(fit_chest)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ chest_discomfort, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.5 > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (patients with chest discomfort and patients without chest discomfort).
+
+## m. pneumonia symptoms
+```{r}
+# pneumonia symptoms
+fit_pneumonia = survfit(Surv(duration, censoring_indicator) ~ pneumonia_symptoms, data = df)
+ggsurvplot(fit_pneumonia, data = df, risk.table = TRUE, title = "Survival Functions by pneumonia")
+autoplot(fit_pneumonia)
+```
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ pneumonia_symptoms, data = df)
+```
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.4 > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (patients with pneumonia symptoms and patients without pneumonia symptoms).
+
+## n. Muscle aches
+```{r}
+# muscle aches
+fit_muscle = survfit(Surv(duration, censoring_indicator) ~ muscle_aches, data = df)
+ggsurvplot(fit_muscle, data = df, risk.table = TRUE, title = "Survival Functions by muscle aches")
+autoplot(fit_muscle)
+```
+
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ muscle_aches, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.1 > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (patients with muscle aches and patients without muscle aches).
+
+## p. Gastrointestinal symptoms
+```{r}
+# pneumonia symptoms
+fit_gastro = survfit(Surv(duration, censoring_indicator) ~ gastrointestinal_symptoms, data = df)
+ggsurvplot(fit_gastro, data = df, risk.table = TRUE, title = "Survival Functions by gastrointestinal symptoms")
+autoplot(fit_gastro)
+```
+
+```{r}
+survdiff(Surv(duration, censoring_indicator) ~ gastrointestinal_symptoms, data = df)
+```
+
+With the significance level $\alpha = 0.05$, the log-rank test show that the p-value = 0.4 > 0.05, suggesting that there is not enough evidence to reject the null hypothesis. In other words, there is no significant difference in the survival functions between the two groups (patients with gastrointestinal symptoms and patients without gastrointestinal symptoms).
+
+```{r}
+# remove outcome variable
+df = subset(df, select = -c(outcome))
+```
+
+# III. Statistical modelling and analysis
+
+## 9.
+```{r}
+## Train test split
+library(caret)
+# Set the seed for reproducibility
+set.seed(1)
+
+# Create an index for data partitioning, stratification on the censorship
+index = createDataPartition(df$censoring_indicator, p = 0.75, list = FALSE)
+
+# Create training and testing sets
+df_train = df[index, ]
+df_test = df[-index, ]
+
+# Check the percentage of censorship in train and test samples
+percentage_censor_train = sum(df_train$censor == 1) / nrow(df_train) * 100
+percentage_censor_test = sum(df_test$censor == 1) / nrow(df_test) * 100
+
+# Print the results
+cat("Percentage of censor in training set:", percentage_censor_train, "%\n")
+cat("Percentage of censor in testing set:", percentage_censor_test, "%\n")
+```
+## 10.
+
+In the dataset, the covariates: hospitalized, time_until_hospitalization are time dependent covariates. Therefore, we create the start-stop model for these covariates.
+
+```{r}
+# Create start-stop
+df_train_merge = tmerge(df_train, df_train, id=ID, event = event(duration,censoring_indicator))
+df_train_merge = tmerge(df_train_merge, df_train, id=ID, hospitalized=tdc(time_until_hospitalization))
+df_train_merge = subset(df_train_merge, select = -c(censoring_indicator, duration, time_until_hospitalization))
+head(df_train_merge)
+```
+
+```{r}
+# Start-stop linear model
+start_stop_linear = coxph(formula = Surv(tstart, tstop, event) ~ .-ID, data = df_train_merge, id = ID, x = TRUE)
+summary(start_stop_linear)
+```
+We could see that in the start-stop model above, only travel_history_binary is statisticaly significant in the model with significant level $\alpha = 0.05$. The coefficients of three covariates: throat_symptoms, hospitalized, and country_groups may be infinte with very high p-value, so these covariates are not statisticaly significant in the start-stop model. Therefore, we will eliminate these 3 covariates out of the start-stop model. Since the time dependent covariate "hospitalized" is eliminated, we will try the start-stop model and the old format cox model (without 4 covariates "hospitalized", "time_until_hospitalization", "throat_symptoms", and "country_groups"). Then we use stepwise variables selection method with criteria AIC (choose the model with minimum AIC)
+
+###. Start-stop linear model
+```{r}
+library(MASS)
+# Start-stop linear model
+model_1 = coxph(formula = Surv(tstart, tstop, event) ~ .-ID-throat_symptoms-hospitalized-country_groups, data = df_train_merge, x = TRUE)
+
+# Perform stepwise variable selection based on AIC with both direction
+start_stop_linear = stepAIC(model_1, direction = "both", trace = FALSE)
+
+summary(start_stop_linear)
+```
+
+### Old format cox model with linear relationship
+```{r}
+# Normal linear model
+model_2 = coxph(formula = Surv(duration, censoring_indicator) ~ .-ID-throat_symptoms-hospitalized-time_until_hospitalization-country_groups, data = df_train, x = TRUE)
+
+# Perform stepwise variable selection based on AIC with both direction
+old_format_linear = stepAIC(model_2, direction = "both", trace = FALSE)
+
+summary(old_format_linear)
+```
+
+After eliminating 4 covariates: throat_symptoms, country_groups, hospitalized, time_until_hospitalization, we could see that the old format model is the same with the start-stop model. This is because the time dependent covariate "hospitalized" has been removed from the model. Therefore, we continue with the old format model.
+
+After the model selection with AIC criteria, we obtained a model with 8 covariates: age, travel_history_binary, latitude, longitude, difficulty_breathing, cough_symptoms, gastrointestinal_symptoms, and pneumonia_symptoms. Moreover, with significant level $\alpha = 0.05$, the cough_symptoms is not significant, other covariates are significant.
+
+We can draw some conclusion for each significant covariate:
+- The hazard ratio (exp(coef)) of the covariate "age" slightly greater than 1 (1.00816), so for a one unit increase in age, the hazard of the death increases by a factor of 1.00816. This indicates that when the age increase 1 year, the risk of death increase 0.816%, which means the old COVID-19 patients have higher risk to die than young patients.
+- The hazard ratio of the covariate "travel_history_binary" is significantly less than 1 (0.07215), which means if the patients have travel history, the risk of death decrease significantly.
+- The hazard ratios of the covariates "latitude" and "longitude" are slightly greater than 1 (1.02597 and 1.05624), which means the increase of latitude and longitude will increase the risk of death.
+- The hazard ratios of the two symptoms "difficulty in breathing" and "gastrointestinal symptoms" are less than 1 (0.36780 and 0.16140), which means if the patients with these 2 symptoms have lower death risk than the patients without. 
+- The hazard ratio of the pneumonia symptoms is much greater than 1, which means the pneumonia symptoms will highly increase the risk of death in COVID-19 patients.
+
+We check if the continuous covariates have linear effect with martingales residuals
+```{r}
+dummy_data = subset(df_train, select = c(ID, age, travel_history_binary, latitude, longitude, difficulty_breathing, cough_symptoms, gastrointestinal_symptoms, pneumonia_symptoms, duration, censoring_indicator))
+
+# convert to numeric
+dummy_data = dummy_data %>%
+  mutate_at(vars(travel_history_binary, difficulty_breathing, cough_symptoms, gastrointestinal_symptoms, pneumonia_symptoms), as.numeric)
+
+# Check for linearity with martingales residuals
+ggcoxfunctional(old_format_linear, data = dummy_data)
+```
+
+We only focus on the three continuous covariates (age, latitude, longitude), they have the nonlinear martingale residuals. Then we try the model include nonlinear relationship.
+
+```{r}
+# nonlinear relationship Cox model
+model_3 = coxph(Surv(duration, censoring_indicator) ~ pspline(age) + travel_history_binary + pspline(latitude) + pspline(longitude) + difficulty_breathing + cough_symptoms + gastrointestinal_symptoms + pneumonia_symptoms , data = df_train, x = TRUE)
+
+summary(model_3)
+```
+
+Then we also use stepwise variable selection to select the model with minimum AIC
+```{r}
+# Perform stepwise variable selection based on AIC with both direction
+model_cox_non_linear <- stepAIC(model_3, direction = "both", trace = FALSE)
+
+summary(model_cox_non_linear)
+```
+In this nonlinear model, with significant level $\alpha = 0.05$, we could see that:
+- For the age, the linear component has a p-value of 0.28, suggesting it is not statistically significant, the nonlinear component is statistically significant (p-value = 0.08) with significant level $\alpha = 0.1$.
+- The covariate travel_history_binary has very small p-value (1.4e-08), indicating a statistically significant impact. The hazard ratio is 0.09378, suggesting that patients with a travel history have a lower hazard compared to those without.
+- For the covariate latitude, the linear and nonlinear components have p-value > 0.05 so it is not statistically significant.
+- For the covariate longitude, its nonlinear component have p-value < 0.05 so it is statistically significant with nonlinear effect.
+- The pneumonia_symptoms has a p-value of 0.00026, indicating a statistically significant of this covariate. The hazard ratio is 9.118, suggesting that individuals with pneumonia symptoms have a much higher hazard compared to those without.
+
+Then we check the proportional hazards assumption (time invariance) via Schoenfeld residuals for the 2 models
+```{r}
+# Cox model with linear relationship
+cox.zph(old_format_linear)
+ggcoxzph(cox.zph(old_format_linear))
+```
+The global Schoenfeld test has p-value < 0.05, indicating that at least one covariate violates the assumption (its coefficient is not constant over time)
+
+The covariates longitude and gastrointestinal_symptoms have p-value > 0.05 so they have constant coefficients. Other covariates with p-value < 0.05, indicating that their coefficients are not constant over time
+
+```{r}
+# Cox model with nonlinear relationship
+cox.zph(model_cox_non_linear)
+ggcoxzph(cox.zph(model_cox_non_linear))
+```
+For the Cox model with nonlinear relationship, only covariate longitude has constant coefficient (p-value > 0.05).
+
+## 11. Evaluation model by Brier score
+
+
+```{r}
+library(riskRegression)
+set.seed(1)
+
+# Cox model with linear relationship
+score_linear = Score(list("Cox model with linear relationship"=old_format_linear),
+                 formula = Surv(duration, censoring_indicator) ~ 1,
+                 data = df_test, metrics = "brier", seed = 1)
+cat("Brier score of Cox model with linear relationship on test data",score_linear$Brier$score$Brier[2])
+```
+```{r}
+# Cox model with nonlinear relationship
+score_non_linear = Score(list("Cox model with non linear relationship"=model_cox_non_linear),
+                 formula = Surv(duration, censoring_indicator) ~ 1,
+                 data = df_test, metrics = "brier", seed = 1)
+cat("Brier score of Cox model with nonlinear relationship on test data",score_non_linear$Brier$score$Brier[2])
+```
+We could see that the mean Brier score of Cox model with nonlinear relationship (0.181) is lower than the mean Brier score of the Cox model with linear relationship (0.194). Therefore, the Cox model with nonlinear relationship seems to be better than the Cox model with linear relationship in prediction on the test data
+
+## 12.
+### Ages and pneumonia symptoms
+First, we will define a set of patients with different ages, pneumonia_symptoms = 1 for young patients and 0 for old patients, other symptoms is set to 0
+```{r}
+individual_age_pneumonia = data.frame(age = c(25, 35, 65, 85),
+                            travel_history_binary = as.factor(rep('False', 4)),
+                            latitude = rep(1.353873, 4),
+                            longitude = rep(103.860478, 4),
+                            difficulty_breathing = as.factor(rep(0, 4)),
+                            cough_symptoms = as.factor(rep(0, 4)),
+                            gastrointestinal_symptoms = as.factor(rep(0, 4)),
+                            pneumonia_symptoms = as.factor(c(1, 1, 0, 0)))
+```
+
+### Cox model with linear relationship
+```{r}
+# Obtain the survival function for the representative individual
+surv_est_age = survfit(old_format_linear, newdata = individual_age_pneumonia)
+summary(surv_est_age)
+```
+
+```{r}
+# Plot the survival function
+plot(surv_est_age, col = 1:4, lty = 1, xlab = "Time", ylab = "Survival Probability", main = "Survival Functions")
+
+# Add legend
+legend("topright", legend = c("Age 25 + pneumonia", "Age 35 + pneumonia", "Age 65 + non-pneumonia", "Age 85 + non-pneumonia"), 
+       col = 1:4, lty = 1, cex = 0.8)
+```
+
+### Cox model with nonlinear relationship
+```{r}
+# Obtain the survival function for the representative individual
+surv_est_age = survfit(model_cox_non_linear, newdata = individual_age_pneumonia)
+summary(surv_est_age)
+```
+
+```{r}
+# Plot the survival function
+plot(surv_est_age, col = 1:4, lty = 1, xlab = "Time", ylab = "Survival Probability", main = "Survival Functions")
+
+# Add legend
+legend("topright", legend = c("Age 25 + pneumonia", "Age 35 + pneumonia", "Age 65 + non-pneumonia", "Age 85 + non-pneumonia"), 
+       col = 1:4, lty = 1, cex = 0.8)
+```
+Regarding the survival functions predicted by Cox models with linear and nonlinear relationship, we could also see the same patterns that the pneumonia symptoms has a strong negative effect to the survival probability of COVID-19 patients over time. The survival probability of young patients (age 25, 35) with pneumonia symptoms decrease even faster than the survival probability of old patients (age 65, 85) without pneumonia symptoms. Therefore, the pneumonia symptoms has much higher negative effect to the COVID-19 patients compared to the age.
+
+The probability that these 4 individuals will survive beyond 21 days:
+- Cox model with linear relationship: 0.37%, 0.23%, 59%, 53.7%, respectively
+- Cox model with nonlinear relationship: 85.8%, 86%, 97.6%, 97.6%, respectively.
+
+## 13.
+We assume that the first patient (age 25) from the patients list defined above in question 12 has been alive for 7 days, then we estimate of the probability that this patient will be still alive for another 14 days (stile alive until day 21st) using the Cox model with linear relationship and Cox model with nonlinear relationship.
+
+```{r}
+# Choose the first patients (age 25) from the patients defined above
+patient_7_days = individual_age_pneumonia[1,]
+```
+
+### Cox model with linear relationship
+```{r}
+# Obtain the survival function for this patient who has been alive for 7 days
+# by Cox model with linear relationship
+survival_estimate_after_7days <- survfit(old_format_linear, newdata = patient_7_days, start.time = 8)
+
+# Print the summary of the survival estimate
+summary(survival_estimate_after_7days)
+```
+
+According to the results, if this patient has been alive for 7 days, the probability that this patient will be still alive for another 14 days (stile alive until day 21st) is 1.3%. This probability is higher than the previous probability (0.37%) (when we did not assume that this patient has been alive for 7 days).
+
+### Cox model with nonlinear relationship
+```{r}
+# Obtain the survival function for this patient who has been alive for 7 days
+# by Cox model with nonlinear relationship
+survival_estimate_after_7days <- survfit(model_cox_non_linear, newdata = patient_7_days, start.time = 8)
+
+# Print the summary of the survival estimate
+summary(survival_estimate_after_7days)
+```
+According to the results, if this patient has been alive for 7 days, the probability that this patient will be still alive for another 14 days (stile alive until day 21st) is 88.7%. This probability is higher than the previous probability (85.8%) (when we did not assume that this patient has been alive for 7 days).
+
+We could draw a conclusion that if a patient has been alive for 7 days, he/she will has higher chance to be still alive for another 14 days. 
+
+## 14. Tree-based model using random forest
+We will try a tree-based model using random forest
+
+```{r}
+library(randomForestSRC)
+set.seed(1)
+```
+
+### Model with default parameters
+
+```{r}
+rf_model = rfsrc(Surv(duration, censoring_indicator) ~ age + travel_history_binary + latitude + longitude + difficulty_breathing + cough_symptoms + gastrointestinal_symptoms + pneumonia_symptoms, data = df_train, seed = 1)
+
+summary(rf_model)
+```
+```{r}
+# Brier score of Random forest model with default parameters on the test data
+brier_rf_default = Score(list("Random Forest model with default parameters" = rf_model), formula = Surv(duration, censoring_indicator) ~ 1, data = df_test, plots = "calibration", seed = 1)
+
+cat("Brier score of Random forest model with default parameters on test data",brier_rf_default $Brier$score$Brier[2])
+```
+The Random Forest model with default parameters has Brier score = 0.184. The Random Forest model is better than the Cox model with linear relationship but not better than the Cox model with nonlinear relationship.
+
+We use grid search to optimize the following parameters:
+- ntree: number of trees
+- mtry: number of variables to possibly split at each node
+- nodedepth: maximum depth of a tree
+
+### Optimize parameters
+
+```{r}
+set.seed(1)
+# Define the parameters grid
+param_grid = expand.grid(ntree = c(100, 200, 300, 400, 500, 600),
+                          mtry = c(NULL, 2, 4, 6, 8, 10),
+                          nodedepth = c(NULL, 1, 2, 3, 4, 5))
+
+# Initialize a list to store the models
+models = list()
+
+# Perform grid search
+for (i in 1:nrow(param_grid)) {
+  rf_model = rfsrc(Surv(duration, censoring_indicator) ~ age + travel_history_binary + 
+                      latitude + longitude + difficulty_breathing + 
+                      cough_symptoms + gastrointestinal_symptoms + pneumonia_symptoms,
+                    data = df_train,
+                    ntree = param_grid$ntree[i],
+                    mtry = param_grid$mtry[i],
+                    nodedepth = param_grid$nodedepth[i])
+
+  models[[i]] = list(model = rf_model, params = param_grid[i, ])
+}
+
+# Evaluate models using Brier score and choose the optimal one based on a test data
+# Initialize an empty vector to store the Brier scores
+test_brier_scores = numeric(length(models))
+
+# Iterate through models using a for loop
+for (i in seq_along(models)) {
+  model = models[[i]]$model
+  score_cv = Score(list("Tree-based model" = model), formula = Surv(duration, censoring_indicator) ~ 1, data = df_test, seed = 1)
+  test_brier_scores[i] = score_cv$Brier$score$Brier[2]
+}
+
+# Identify the optimal model based on the brier score
+best_model_index = which.min(test_brier_scores)
+best_model = models[[best_model_index]]
+print(best_model)
+
+# Save the optimal random forest model
+rf_model_optimized = best_model$model
+```
+
+After using grid search, we obtain the optimal values for parameters: 
+- ntree = 600 (number of trees)
+- mtry = 2 (number of variables to possibly split at each node)
+- nodedepth = 5 (maximum depth of a tree)
+
+```{r}
+# Brier score of Random forest model on the test data
+brier_rf_optimized = Score(list("Random Forest model with optimal parameters" = rf_model_optimized), formula = Surv(duration, censoring_indicator) ~ 1, data = df_test, metrics = "brier")
+
+cat("Brier score of Random forest model with optimal parameters on test data",brier_rf_optimized $Brier$score$Brier[2])
+```
+
+The Random Forest model with optimal parameters the parameters has mean Brier score = 0.179. The Random Forest model with optimal parameters is better then the Random Forest model with default parameters and also the two Cox models (linear and nonlinear) in prediction the test data.
+
+# 15.
+In conclusion, the Random Forest model with optimal parameters is the best model for prediction the survival probability of COVID-19 patients in term of Brier score. However, the Random Forest model is more difficult in interpretation compare to the 2 Cox models. All these models have Brier scores below 0.25, so these models are useful in prediction. The 2 Cox models is a better choice for interpreting the effect of covariates to the survival probability of COVID-19 patients. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
